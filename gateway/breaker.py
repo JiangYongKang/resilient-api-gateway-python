@@ -54,6 +54,16 @@ class CircuitBreaker:
     def _cooldown_passed(self) -> bool:
         return time.monotonic() - self._opened_at >= self.config.recovery_timeout
 
+    def probe_due(self) -> bool:
+        """仅观测：是否处于 OPEN 且冷却已到期（后台探测循环据此调度）。
+
+        真正的状态切换仍在 before_call 中完成，这里不改变任何状态。
+        """
+        with self._lock:
+            return (self._state is CircuitState.OPEN
+                    and not self._probe_in_flight
+                    and self._cooldown_passed())
+
     def _transition(self, new_state: CircuitState, note: str = "") -> None:
         old = self._state
         if old is new_state:
@@ -87,6 +97,19 @@ class CircuitBreaker:
                 self._probe_in_flight = True
                 return True, CircuitState.HALF_OPEN, None
             return False, CircuitState.HALF_OPEN, FailReason.CIRCUIT_REJECTED
+
+    def abort_probe(self) -> CircuitState:
+        """中止一次未能真正打到上游的探测（如等不到并发槽位）。
+
+        回到 OPEN 但不重新计时冷却（_opened_at 保持不变），也不计入失败：
+        上游本身没有被调用，不该为它没犯的错受罚；探测节奏由探测器的退避控制。
+        """
+        with self._lock:
+            self._probe_in_flight = False
+            if self._state is CircuitState.HALF_OPEN:
+                self._transition(CircuitState.OPEN,
+                                 "(probe aborted before reaching upstream)")
+            return self._state
 
     def record_success(self) -> CircuitState:
         with self._lock:

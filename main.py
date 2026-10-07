@@ -8,8 +8,11 @@
 - payments -> 持续 500（用于演示部分失败与熔断）
 
 可用 GW_TOTAL_TIMEOUT / GW_UPSTREAM_TIMEOUT / GW_BREAKER_THRESHOLD /
-GW_BREAKER_RECOVERY / GW_MAX_CONCURRENCY 等环境变量调整。
-启动后访问 http://127.0.0.1:8000/aggregate 与 /circuits。
+GW_BREAKER_RECOVERY / GW_MAX_CONCURRENCY 以及探测相关的
+GW_PROBE_ENABLED / GW_PROBE_INTERVAL / GW_PROBE_TIMEOUT /
+GW_PROBE_MAX_BACKOFF 等环境变量调整。
+启动后访问 http://127.0.0.1:8000/aggregate 、 /circuits 与 /recovery
+（/recovery 可观察 payments 熔断后后台自愈探测的恢复进展）。
 """
 
 from __future__ import annotations

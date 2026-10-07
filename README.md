@@ -12,13 +12,14 @@ gateway/
   config.py          # 配置：上游列表、总预算、单上游超时、并发、熔断参数
   models.py          # 响应模型与失败原因枚举 FailReason / 熔断状态 CircuitState
   breaker.py         # 熔断器（CLOSED/OPEN/HALF_OPEN）与按上游隔离的注册表
+  prober.py          # 自愈探测器：熔断后后台主动探测恢复，带退避节流
   upstream.py        # httpx 调用封装：异常/状态码 -> 可区分失败原因
   aggregator.py      # 聚合核心：总预算、信号量并发控制、结果合并、日志
   mock_upstream.py   # mock 上游 ASGI 应用（ok/slow/error/malformed/not_found）
   mock_server.py     # 后台线程启动真实 uvicorn mock 服务
-  app.py             # FastAPI 应用工厂（/aggregate /circuits /health）
+  app.py             # FastAPI 应用工厂（/aggregate /circuits /recovery /health）
 main.py              # 一键启动 3 个 mock 上游 + 网关（端口 8000）
-tests/               # 16 个测试：部分失败 / 熔断恢复 / 超时预算 / 并发突发
+tests/               # 20 个测试：部分失败 / 熔断恢复 / 自愈探测 / 超时预算 / 并发突发
 ```
 
 ## 快速开始
@@ -91,6 +92,67 @@ HALF_OPEN 期间其余并发请求 ──▶ 直接拒绝 reason=circuit_rejecte
   `[breaker] upstream=orders CLOSED -> OPEN (failure_count=3 reached threshold 3)`。
 - 可随时 `GET /circuits` 查看所有上游的状态、连续失败计数与探测标记。
 
+## 自愈探测（后台主动恢复）
+
+熔断打开后，网关**不需要等下一个客户端请求**来被动触发半开探测：
+后台探测循环（`gateway/prober.py`）按固定间隔扫描各上游熔断器，
+发现 OPEN 且冷却到期的上游就**主动发起一次真实探测请求**，全程无需重启、
+无需人工重置状态。上游一旦恢复，探测成功即 CLOSED，紧接着的正常聚合
+立刻拿到真实数据。
+
+行为要点（与现有失败/降级语义、预算/并发约束完全兼容）：
+
+- **同一上游同一时刻至多一次探测在飞**：仍由熔断器 HALF_OPEN 唯一探测位
+  保证；探测在飞期间其它客户端请求照旧得到 `reason=circuit_rejected`、
+  `degraded=true` 的降级结果，与上游真实报错（`http_error`/`timeout` 等）
+  明确可区分。
+- **不挤占健康上游容量**：探测与正常聚合共用同一个全局并发信号量，
+  且同时在飞的探测总数受 `max_concurrent_probes`（默认 1）限制。
+- **预算有界**：每个探测的自身预算为 `min(上游自身超时, GW_PROBE_TIMEOUT)`，
+  独立于聚合总预算，不会因为探测拖慢任何一次聚合响应。
+- **压力下收敛**：探测排队等并发槽位时按 FIFO 信号量唤醒，最长等待
+  `GW_PROBE_ACQUIRE_TIMEOUT`；即使并发被打满、预算卡得很紧，探测也终将
+  拿到槽位真正打到上游。实在等不到则中止本次探测（`abort_probe`，
+  **不计入上游失败**、不重置冷却计时），下个周期自动重试——不会出现
+  “上游已恢复却永远只拿到降级结果”的情况。
+- **长期失败有退避节流**：探测连续失败时，下次探测间隔按
+  `interval * backoff_multiplier^连续失败次数` 指数增长并封顶
+  `max_backoff`（与熔断冷却取较大者生效），不会把预算一直烧在
+  恢复不了的上游上。
+- **可观测**：`GET /recovery` 只读返回每个上游的恢复进展
+  （累计尝试/成功/失败次数、最近一次探测结果、是否有探测在飞、
+  距下次探测的毫秒数、是否已恢复正常放行）以及探测配置；
+  关键状态流转（启动、发起探测、成功/失败、退避）按时间顺序写入
+  `gateway.prober` 日志。
+
+### 探测配置项（环境变量）
+
+| 项 | 环境变量 | 默认 | 说明 |
+|---|---|---|---|
+| 开关 | `GW_PROBE_ENABLED` | `true` | 是否启用后台自愈探测 |
+| 扫描/基础间隔（秒） | `GW_PROBE_INTERVAL` | 0.5 | 探测循环扫描间隔，也是退避基数 |
+| 探测自身预算（秒） | `GW_PROBE_TIMEOUT` | 1.0 | 单次探测调用的超时上限 |
+| 等并发槽位耐心（秒） | `GW_PROBE_ACQUIRE_TIMEOUT` | 5.0 | 超过则中止本次探测、下周期重试 |
+| 同时在飞探测数 | `GW_PROBE_MAX_CONCURRENT` | 1 | 保护健康上游容量 |
+| 退避乘数 | `GW_PROBE_BACKOFF_MULTIPLIER` | 2.0 | 连续失败时探测间隔的增长倍率 |
+| 退避上限（秒） | `GW_PROBE_MAX_BACKOFF` | 30.0 | 长期失败时的最低探测频率 |
+
+代码中可用 `gateway.config.ProbeConfig` 显式构造并经
+`build_config(..., probe=...)` 传入（测试即如此把间隔缩到 0.1s 加快验证）。
+
+### 本地验证自愈
+
+```bash
+uv run python main.py          # payments 默认持续 500
+# 另开终端连续观察（无需手动触发恢复）：
+curl -s http://127.0.0.1:8000/circuits   # payments -> OPEN
+curl -s http://127.0.0.1:8000/recovery   # 探测次数/最近结果/退避倒计时
+# 把 payments 切回正常（mock 控制面）：
+curl -s -X POST http://127.0.0.1:<payments端口>/control -d '{"mode":"ok"}'
+# 几秒内 /recovery 中 payments.recovered 变为 true，
+# /aggregate 自动重新拿到 payments 的真实数据，全程无需重启。
+```
+
 ## 超时预算与并发控制
 
 - **统一总预算** `total_timeout`：每个上游的实际等待时间为
@@ -133,22 +195,27 @@ HALF_OPEN 期间其余并发请求 ──▶ 直接拒绝 reason=circuit_rejecte
 ## 本地验证（测试）
 
 ```bash
-uv run pytest                      # 全部 16 个测试
+uv run pytest                      # 全部 20 个测试
 uv run pytest -s                  # -s 可看到每个上游结果与熔断状态变化日志
 uv run pytest tests/test_circuit_breaker.py   # 只跑熔断类
+uv run pytest tests/test_self_healing.py      # 只跑自愈探测类
 uv run pytest tests/test_timeout.py           # 只跑超时预算类
 ```
 
-四类场景：
+五类场景：
 
 1. **部分失败** `tests/test_partial_failure.py`：成功/500/畸形混合仍 200 返回
    部分结果；全失败 503；404 不熔断；失败 `data` 恒为 null、原因可区分、顺序稳定。
 2. **熔断触发与恢复** `tests/test_circuit_breaker.py`：单次/两次失败不熔断；
    达阈值 OPEN 并快速失败（`circuit_open`）；各上游隔离；冷却后半开探测成功
    恢复 / 失败重开；半开期间唯一探测，其余 `circuit_rejected`。
-3. **超时预算** `tests/test_timeout.py`：单上游自身超时；全慢场景下整体耗时
+3. **自愈探测** `tests/test_self_healing.py`：熔断后无需任何客户端请求，
+   后台探测自动发现上游恢复并回到正常放行；并发打满 + 总预算紧张的极端
+   压力下探测仍收敛；探测在飞期间其它请求得到可区分的降级结果；
+   长期失败按指数退避节流，`/recovery` 可观测全过程。
+4. **超时预算** `tests/test_timeout.py`：单上游自身超时；全慢场景下整体耗时
    的硬上限断言；`timeout` 与 `budget_exceeded` 区分；两次运行结论一致。
-4. **并发突发** `tests/test_concurrency.py`：突发 5~12 个并发聚合，服务端观测
+5. **并发突发** `tests/test_concurrency.py`：突发 5~12 个并发聚合，服务端观测
    并发峰值不超过上限；突发响应结果签名唯一、确定可重复；串行限流不丢结果；
    熔断后突发 10 个请求对故障上游全部稳定降级。
 

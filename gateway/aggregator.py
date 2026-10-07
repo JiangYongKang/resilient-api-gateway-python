@@ -25,6 +25,7 @@ from gateway.models import (
     FailReason,
     UpstreamResult,
 )
+from gateway.prober import ProbeOutcome, RecoveryProber
 from gateway.upstream import UpstreamCallError, UpstreamClient
 
 logger = logging.getLogger("gateway.aggregate")
@@ -50,8 +51,11 @@ class Aggregator:
         self._semaphore = asyncio.Semaphore(config.max_concurrent_calls)
         self._client = client
         self._client_owned = client is None
+        self.prober = RecoveryProber(
+            config.probe, registry, config.upstreams, self.probe_upstream)
 
     async def aclose(self) -> None:
+        await self.prober.stop()
         if self._client_owned and self._client is not None:
             await self._client.aclose()
             self._client = None
@@ -68,6 +72,8 @@ class Aggregator:
         return self._client
 
     async def aggregate(self) -> AggregateResponse:
+        # 懒启动后台自愈探测（幂等）：首个请求到来即生效，无需人工介入
+        self.prober.start()
         start = time.monotonic()
         deadline = start + self.config.total_timeout
 
@@ -202,6 +208,57 @@ class Aggregator:
                 elapsed_ms=elapsed_ms(), circuit_state=new_state)
             self._log_result(result)
             return result
+
+    # ------------------------------------------------------------------
+    async def probe_upstream(self, name: str) -> ProbeOutcome:
+        """后台自愈探测：对熔断上游发起一次真实探测请求。
+
+        与正常聚合共用同一个并发信号量（不额外挤占容量），
+        探测自身预算 = min(上游自身超时, probe.timeout)，独立于聚合总预算；
+        等不到并发槽位时中止本次探测（abort_probe，不计上游失败），
+        由探测器退避后重试，保证压力下最终收敛。
+        """
+        uc = next((u for u in self.config.upstreams if u.name == name), None)
+        if uc is None:
+            return ProbeOutcome(attempted=False, error=f"unknown upstream {name!r}")
+        breaker = self.registry.get(name)
+
+        # 熔断闸门：OPEN 且冷却到期 -> HALF_OPEN 并占位唯一探测
+        allowed, _state, _reason = breaker.before_call()
+        if not allowed:
+            return ProbeOutcome(attempted=False,
+                                error="probe slot not granted by breaker")
+
+        http_client = await self._get_client()
+        try:
+            # 并发闸门：耐心排队（FIFO 信号量保证终将拿到槽位），
+            # 但不超过 acquire_timeout，避免一个探测无限占用调度
+            try:
+                await asyncio.wait_for(
+                    self._semaphore.acquire(),
+                    timeout=self.config.probe.acquire_timeout)
+            except TimeoutError:
+                breaker.abort_probe()
+                return ProbeOutcome(
+                    attempted=False,
+                    error="concurrency slot unavailable within acquire_timeout")
+            try:
+                try:
+                    await UpstreamClient(uc).fetch(
+                        http_client, self.config.probe.timeout)
+                except UpstreamCallError as exc:
+                    breaker.record_failure(
+                        counts=exc.reason in _FAILURES_COUNTING_TO_BREAKER)
+                    return ProbeOutcome(attempted=True, ok=False,
+                                        reason=exc.reason.value, error=str(exc))
+                breaker.record_success()
+                return ProbeOutcome(attempted=True, ok=True)
+            finally:
+                self._semaphore.release()
+        except asyncio.CancelledError:
+            # 探测器停止/关闭：释放探测位，不把取消算成上游失败
+            breaker.abort_probe()
+            raise
 
     # ------------------------------------------------------------------
     @staticmethod

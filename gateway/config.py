@@ -30,6 +30,29 @@ class BreakerConfig:
 
 
 @dataclass(frozen=True)
+class ProbeConfig:
+    """自愈探测（后台主动恢复）参数。
+
+    上游被熔断后，冷却到期由后台探测循环主动发起真实探测请求，
+    不等下一个客户端请求被动触发；探测同样受并发上限与自身预算约束。
+    """
+    # 是否启用后台自愈探测
+    enabled: bool = True
+    # 探测循环扫描间隔（秒）：也是探测的基础间隔
+    interval: float = 0.5
+    # 单个探测请求的自身时间预算（秒），独立于聚合总预算
+    timeout: float = 1.0
+    # 探测等待并发信号量的耐心上限（秒）：压力再大也会重试直到拿到槽位
+    acquire_timeout: float = 5.0
+    # 同一时刻最多允许多少个探测在飞（保护健康上游容量）
+    max_concurrent_probes: int = 1
+    # 持续失败时的退避：间隔 = interval * multiplier**连续失败次数，封顶 max_backoff
+    backoff_multiplier: float = 2.0
+    # 退避上限（秒）：长期恢复不了的上游最多按此频率探测，不一直烧预算
+    max_backoff: float = 30.0
+
+
+@dataclass(frozen=True)
 class GatewayConfig:
     upstreams: tuple[UpstreamConfig, ...] = field(default_factory=tuple)
     # 整个聚合请求的统一时间预算（秒）：任何慢上游都不能把整体拖过该预算
@@ -39,6 +62,7 @@ class GatewayConfig:
     # 全局同时进行中的上游 HTTP 调用上限（并发负载控制）
     max_concurrent_calls: int = 8
     breaker: BreakerConfig = field(default_factory=BreakerConfig)
+    probe: ProbeConfig = field(default_factory=ProbeConfig)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -51,12 +75,20 @@ def _env_int(name: str, default: int) -> int:
     return int(raw) if raw else default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def build_config(upstreams: tuple[UpstreamConfig, ...],
                  total_timeout: float | None = None,
                  default_upstream_timeout: float | None = None,
                  max_concurrent_calls: int | None = None,
                  failure_threshold: int | None = None,
-                 recovery_timeout: float | None = None) -> GatewayConfig:
+                 recovery_timeout: float | None = None,
+                 probe: ProbeConfig | None = None) -> GatewayConfig:
     """显式构造配置；未提供的项回退到环境变量再回退到默认值。"""
     return GatewayConfig(
         upstreams=upstreams,
@@ -75,6 +107,15 @@ def build_config(upstreams: tuple[UpstreamConfig, ...],
             recovery_timeout=recovery_timeout
             if recovery_timeout is not None
             else _env_float("GW_BREAKER_RECOVERY", 5.0),
+        ),
+        probe=probe if probe is not None else ProbeConfig(
+            enabled=_env_bool("GW_PROBE_ENABLED", True),
+            interval=_env_float("GW_PROBE_INTERVAL", 0.5),
+            timeout=_env_float("GW_PROBE_TIMEOUT", 1.0),
+            acquire_timeout=_env_float("GW_PROBE_ACQUIRE_TIMEOUT", 5.0),
+            max_concurrent_probes=_env_int("GW_PROBE_MAX_CONCURRENT", 1),
+            backoff_multiplier=_env_float("GW_PROBE_BACKOFF_MULTIPLIER", 2.0),
+            max_backoff=_env_float("GW_PROBE_MAX_BACKOFF", 30.0),
         ),
     )
 
