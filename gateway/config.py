@@ -30,6 +30,27 @@ class BreakerConfig:
 
 
 @dataclass(frozen=True)
+class ProbeConfig:
+    """自愈探测（后台主动恢复）参数。
+
+    探测复用与正常调用相同的总预算/信号量约束，同一上游同一时刻最多一次探测。
+    """
+    # 是否启用后台自愈探测（关闭后退回“等下一次客户端请求被动触发”的行为）
+    enabled: bool = True
+    # 后台扫描间隔（秒）：每隔多久检查一次是否有冷却到期的熔断器
+    interval: float = 0.5
+    # 单次探测的统一时间预算（秒）：等信号量 + 真正请求都在该预算内
+    timeout: float = 2.0
+    # 探测失败后的基础退避（秒），按连续失败次数指数增长
+    base_backoff: float = 0.5
+    # 退避上限（秒）：连续失败次数超过 max_attempts 后固定按该间隔探测，
+    # 永不彻底停止（保证上游恢复后总能收敛），但不会把预算持续耗在坏上游上
+    max_backoff: float = 10.0
+    # 退避增长所计的最大连续失败次数（达到后间隔饱和为 max_backoff）
+    max_attempts: int = 5
+
+
+@dataclass(frozen=True)
 class GatewayConfig:
     upstreams: tuple[UpstreamConfig, ...] = field(default_factory=tuple)
     # 整个聚合请求的统一时间预算（秒）：任何慢上游都不能把整体拖过该预算
@@ -39,6 +60,7 @@ class GatewayConfig:
     # 全局同时进行中的上游 HTTP 调用上限（并发负载控制）
     max_concurrent_calls: int = 8
     breaker: BreakerConfig = field(default_factory=BreakerConfig)
+    probe: ProbeConfig = field(default_factory=ProbeConfig)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -51,12 +73,20 @@ def _env_int(name: str, default: int) -> int:
     return int(raw) if raw else default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def build_config(upstreams: tuple[UpstreamConfig, ...],
                  total_timeout: float | None = None,
                  default_upstream_timeout: float | None = None,
                  max_concurrent_calls: int | None = None,
                  failure_threshold: int | None = None,
-                 recovery_timeout: float | None = None) -> GatewayConfig:
+                 recovery_timeout: float | None = None,
+                 probe: ProbeConfig | None = None) -> GatewayConfig:
     """显式构造配置；未提供的项回退到环境变量再回退到默认值。"""
     return GatewayConfig(
         upstreams=upstreams,
@@ -75,6 +105,14 @@ def build_config(upstreams: tuple[UpstreamConfig, ...],
             recovery_timeout=recovery_timeout
             if recovery_timeout is not None
             else _env_float("GW_BREAKER_RECOVERY", 5.0),
+        ),
+        probe=probe if probe is not None else ProbeConfig(
+            enabled=_env_bool("GW_PROBE_ENABLED", True),
+            interval=_env_float("GW_PROBE_INTERVAL", 0.5),
+            timeout=_env_float("GW_PROBE_TIMEOUT", 2.0),
+            base_backoff=_env_float("GW_PROBE_BACKOFF", 0.5),
+            max_backoff=_env_float("GW_PROBE_MAX_BACKOFF", 10.0),
+            max_attempts=_env_int("GW_PROBE_MAX_ATTEMPTS", 5),
         ),
     )
 

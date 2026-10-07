@@ -17,7 +17,7 @@ import time
 
 import httpx
 
-from gateway.breaker import CircuitBreakerRegistry
+from gateway.breaker import FAILURES_COUNTING_TO_BREAKER, CircuitBreakerRegistry
 from gateway.config import GatewayConfig, UpstreamConfig
 from gateway.models import (
     AggregateResponse,
@@ -25,18 +25,13 @@ from gateway.models import (
     FailReason,
     UpstreamResult,
 )
+from gateway.prober import SelfHealingProber
 from gateway.upstream import UpstreamCallError, UpstreamClient
 
 logger = logging.getLogger("gateway.aggregate")
 
-# 这些失败表示上游不健康，计入连续失败计数
-_FAILURES_COUNTING_TO_BREAKER = frozenset({
-    FailReason.TIMEOUT,
-    FailReason.BUDGET_EXCEEDED,
-    FailReason.HTTP_ERROR,
-    FailReason.UPSTREAM_ERROR,
-    FailReason.BAD_RESPONSE,
-})
+# 历史别名：计入熔断器的失败集合现在由 breaker 模块统一定义
+_FAILURES_COUNTING_TO_BREAKER = FAILURES_COUNTING_TO_BREAKER
 
 _BUDGET_GRACE = 0.25  # 外层兜底余量（秒），正常路径不会用到
 
@@ -50,8 +45,12 @@ class Aggregator:
         self._semaphore = asyncio.Semaphore(config.max_concurrent_calls)
         self._client = client
         self._client_owned = client is None
+        # 后台自愈探测器：与正常流量共享同一信号量与统一预算口径
+        self.prober = SelfHealingProber(
+            config, registry, self._semaphore, self._get_client)
 
     async def aclose(self) -> None:
+        await self.prober.aclose()
         if self._client_owned and self._client is not None:
             await self._client.aclose()
             self._client = None
@@ -68,6 +67,7 @@ class Aggregator:
         return self._client
 
     async def aggregate(self) -> AggregateResponse:
+        self.prober.ensure_started()
         start = time.monotonic()
         deadline = start + self.config.total_timeout
 

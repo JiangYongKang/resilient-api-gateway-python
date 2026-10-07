@@ -16,7 +16,7 @@ import pytest
 import pytest_asyncio
 
 from gateway.app import create_app
-from gateway.config import build_config, UpstreamConfig
+from gateway.config import ProbeConfig, build_config, UpstreamConfig
 from gateway.mock_server import MockServer
 from gateway.mock_upstream import create_mock_app
 
@@ -80,6 +80,9 @@ class GatewayHandle:
     async def circuits(self) -> dict:
         return (await self.client.get("/circuits")).json()
 
+    async def recovery(self) -> dict:
+        return (await self.client.get("/recovery")).json()
+
 
 @pytest_asyncio.fixture
 async def gateway_factory(mock_cluster):
@@ -90,7 +93,8 @@ async def gateway_factory(mock_cluster):
                     failure_threshold: int = 3,
                     recovery_timeout: float = 1.0,
                     max_concurrency: int = 8,
-                    upstream_overrides: dict[str, dict] | None = None) -> GatewayHandle:
+                    upstream_overrides: dict[str, dict] | None = None,
+                    probe: ProbeConfig | None = None) -> GatewayHandle:
         upstream_overrides = upstream_overrides or {}
         upstreams = tuple(
             UpstreamConfig(
@@ -108,6 +112,7 @@ async def gateway_factory(mock_cluster):
             max_concurrent_calls=max_concurrency,
             failure_threshold=failure_threshold,
             recovery_timeout=recovery_timeout,
+            probe=probe,
         )
         app = create_app(config)
         transport = httpx.ASGITransport(app=app)
@@ -119,6 +124,8 @@ async def gateway_factory(mock_cluster):
     yield _make
 
     for handle in handles:
+        # 先停掉后台探测任务，再关客户端，避免事件循环关闭时遗留任务
+        await handle.app.state.aggregator.aclose()
         await handle.client.aclose()
 
 

@@ -23,6 +23,15 @@ from gateway.models import CircuitState, FailReason
 
 logger = logging.getLogger("gateway.breaker")
 
+# 这些失败表示上游不健康，计入连续失败计数（聚合器与探测器共用同一口径）
+FAILURES_COUNTING_TO_BREAKER = frozenset({
+    FailReason.TIMEOUT,
+    FailReason.BUDGET_EXCEEDED,
+    FailReason.HTTP_ERROR,
+    FailReason.UPSTREAM_ERROR,
+    FailReason.BAD_RESPONSE,
+})
+
 
 class CircuitBreaker:
     def __init__(self, name: str, config: BreakerConfig) -> None:
@@ -53,6 +62,14 @@ class CircuitBreaker:
 
     def _cooldown_passed(self) -> bool:
         return time.monotonic() - self._opened_at >= self.config.recovery_timeout
+
+    def cooldown_remaining(self) -> float:
+        """距冷却结束还剩多少秒（<=0 表示已到期）。供后台探测调度使用。"""
+        with self._lock:
+            if self._state is not CircuitState.OPEN:
+                return 0.0
+            return max(0.0, self.config.recovery_timeout
+                       - (time.monotonic() - self._opened_at))
 
     def _transition(self, new_state: CircuitState, note: str = "") -> None:
         old = self._state
@@ -94,6 +111,19 @@ class CircuitBreaker:
             self._probe_in_flight = False
             if self._state is not CircuitState.CLOSED:
                 self._transition(CircuitState.CLOSED, "(probe succeeded)")
+            return self._state
+
+    def abort_probe(self) -> CircuitState:
+        """探测名额已占用、但请求根本没打到上游（如信号量等待超预算）时调用。
+
+        不算失败、不重置冷却：回到 OPEN 且保留原冷却起点，使下一次
+        before_call 能立即再次放行探测；探测节奏由后台探测器的退避控制。
+        """
+        with self._lock:
+            self._probe_in_flight = False
+            if self._state is CircuitState.HALF_OPEN:
+                self._transition(CircuitState.OPEN,
+                                 "(probe aborted before reaching upstream)")
             return self._state
 
     def record_failure(self, counts: bool = True) -> CircuitState:

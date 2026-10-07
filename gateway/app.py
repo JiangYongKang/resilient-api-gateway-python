@@ -4,6 +4,7 @@
 - GET /aggregate      并发聚合全部上游，返回部分结果 + 失败标记
 - GET /health         网关存活
 - GET /circuits       各上游熔断器当前状态（可观测）
+- GET /recovery       各自愈探测的恢复进展（只读观测：最近探测结果/次数/是否已恢复）
 """
 
 from __future__ import annotations
@@ -63,6 +64,12 @@ def create_app(config: GatewayConfig) -> FastAPI:
                 "recovery_timeout": config.breaker.recovery_timeout,
             },
         }
+
+    @app.get("/recovery")
+    def recovery() -> dict:
+        """自愈探测进展（只读）：每个上游最近一次探测结果、尝试次数、
+        退避窗口与是否已恢复到可正常调用。"""
+        return aggregator.prober.snapshot()
 
     return app
 

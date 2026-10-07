@@ -9,16 +9,17 @@
 
 ```
 gateway/
-  config.py          # 配置：上游列表、总预算、单上游超时、并发、熔断参数
+  config.py          # 配置：上游列表、总预算、单上游超时、并发、熔断与探测参数
   models.py          # 响应模型与失败原因枚举 FailReason / 熔断状态 CircuitState
   breaker.py         # 熔断器（CLOSED/OPEN/HALF_OPEN）与按上游隔离的注册表
+  prober.py          # 后台自愈探测器：冷却后主动探测、退避节流、恢复观测
   upstream.py        # httpx 调用封装：异常/状态码 -> 可区分失败原因
   aggregator.py      # 聚合核心：总预算、信号量并发控制、结果合并、日志
   mock_upstream.py   # mock 上游 ASGI 应用（ok/slow/error/malformed/not_found）
   mock_server.py     # 后台线程启动真实 uvicorn mock 服务
-  app.py             # FastAPI 应用工厂（/aggregate /circuits /health）
+  app.py             # FastAPI 应用工厂（/aggregate /circuits /recovery /health）
 main.py              # 一键启动 3 个 mock 上游 + 网关（端口 8000）
-tests/               # 16 个测试：部分失败 / 熔断恢复 / 超时预算 / 并发突发
+tests/               # 21 个测试：部分失败 / 熔断恢复 / 超时预算 / 并发突发 / 自愈探测
 ```
 
 ## 快速开始
@@ -35,12 +36,15 @@ uv run python main.py        # 启动 3 个本地 mock 上游 + 网关
 ```bash
 curl -s http://127.0.0.1:8000/aggregate | python3 -m json.tool
 curl -s http://127.0.0.1:8000/circuits  | python3 -m json.tool
+curl -s http://127.0.0.1:8000/recovery  | python3 -m json.tool
 ```
 
 `main.py` 默认起三个上游：`users`（正常）、`orders`（慢但成功，0.2s）、
 `payments`（持续 HTTP 500，用于观察部分失败与熔断：连续失败达到阈值后
 `/aggregate` 中它的 `reason` 从 `http_error` 变为 `circuit_open`，
-`degraded=true`）。
+`degraded=true`）。把 payments 的 `/control` 切回 `ok` 后无需任何操作，
+后台探测会在冷却到期后自动发现恢复，`/recovery` 中可看到它的
+`last_result` 变为 `success`、`recovered` 变为 `true`。
 
 ## 聚合与部分失败语义
 
@@ -91,6 +95,71 @@ HALF_OPEN 期间其余并发请求 ──▶ 直接拒绝 reason=circuit_rejecte
   `[breaker] upstream=orders CLOSED -> OPEN (failure_count=3 reached threshold 3)`。
 - 可随时 `GET /circuits` 查看所有上游的状态、连续失败计数与探测标记。
 
+## 自愈探测（后台主动恢复）
+
+默认开启。熔断器 OPEN 后，网关**不再干等下一次客户端请求**：后台探测任务
+按固定间隔扫描所有上游，冷却（`recovery_timeout`）一到就**主动**把一次真实
+探测请求发给上游；探测成功即拉回 CLOSED，后续聚合立刻恢复返回真实数据。
+全程不需要重启服务、不需要人工重置状态、也不需要手动打一次请求。
+
+行为规则：
+
+- **同样的预算与并发约束**：探测复用与正常聚合完全相同的全局信号量
+  （`max_concurrent_calls`），单次探测有自己的统一时间预算
+  （`GW_PROBE_TIMEOUT`，等信号量 + 发请求都在预算内）。探测不会挤垮健康
+  上游：等不到并发槽位就主动让出、下一轮再来。
+- **收敛性保证**：探测若在预算内没抢到并发槽位（并发打满/预算紧张），
+  **不算失败、不重置冷却**，下一轮立即重试；信号量按 FIFO 唤醒，探测最终
+  一定能真正打到上游。不允许出现“上游已恢复却永远只返回降级结果”。
+- **单探测语义**：同一上游同一时刻最多一次探测在飞（复用 HALF_OPEN 闸门）；
+  探测在飞期间的客户端请求得到 `reason=circuit_rejected`、`degraded=true`
+  的降级结果，与上游真实报错（`http_error`/`timeout` 等）明确可区分。
+- **节流与退避**：探测真正打到上游但失败时，按连续失败次数指数退避
+  （`base_backoff * 2^n`，上限 `max_backoff`），连续失败次数达到
+  `max_attempts` 后间隔饱和为 `max_backoff`——探测**永不彻底停止**
+  （保证恢复收敛），但不会把预算持续耗在长期坏掉的上游上。
+- **兼容范围**：探测只改变“谁触发半开探测”，不改变任何既有语义——
+  部分失败合并、失败原因分类、熔断阈值/隔离、总预算与并发上限、
+  `degraded` 标记的含义全部保持不变。关闭探测（`GW_PROBE_ENABLED=0`）后
+  完全退回原有的“等客户端请求被动触发半开”行为。
+
+### 恢复进展观测（只读）
+
+`GET /recovery` 返回每个上游的恢复进展与探测配置：
+
+```json
+{
+  "enabled": true,
+  "config": {"interval": 0.5, "timeout": 2.0, "base_backoff": 0.5,
+             "max_backoff": 10.0, "max_attempts": 5},
+  "upstreams": {
+    "payments": {
+      "state": "OPEN", "recovered": false,
+      "probe_in_flight": false, "attempts": 3, "total_probes": 3,
+      "last_result": "failure",
+      "last_probe_ago_ms": 812, "next_probe_in_ms": 3188,
+      "cooldown_remaining_ms": 0
+    }
+  }
+}
+```
+
+- `last_result`：`success` / `failure`（真实打到上游但失败）/ `aborted`
+  （预算内没抢到并发槽位，未打到上游，不计失败）；
+- `attempts`：连续探测失败次数（决定当前退避档位）；`total_probes`：累计
+  真实探测次数；`recovered=true` 表示该上游已恢复到可被正常调用。
+
+关键状态流转按时间顺序体现在日志里（`gateway.prober` / `gateway.breaker`
+logger），例如：
+
+```
+[breaker] upstream=payments CLOSED -> OPEN (failure_count=3 reached threshold 3)
+[prober] upstream=payments probe START (cooldown passed, attempts=0)
+[prober] upstream=payments probe FAILED reason=http_error attempts=1 backoff=0.500s circuit=OPEN
+[prober] upstream=payments probe START (cooldown passed, attempts=1)
+[prober] upstream=payments probe OK -> recovered circuit=CLOSED total_probes=2
+```
+
 ## 超时预算与并发控制
 
 - **统一总预算** `total_timeout`：每个上游的实际等待时间为
@@ -113,6 +182,12 @@ HALF_OPEN 期间其余并发请求 ──▶ 直接拒绝 reason=circuit_rejecte
 | 全局并发上限 | `GW_MAX_CONCURRENCY` | 8 | 同时在飞的上游 HTTP 调用数 |
 | 熔断失败阈值 | `GW_BREAKER_THRESHOLD` | 3 | 连续失败达到该值才 OPEN |
 | 熔断冷却（秒） | `GW_BREAKER_RECOVERY` | 5.0 | OPEN 后多久允许半开探测 |
+| 自愈探测开关 | `GW_PROBE_ENABLED` | 1 | 0 关闭后台探测，退回被动半开 |
+| 探测扫描间隔（秒） | `GW_PROBE_INTERVAL` | 0.5 | 后台检查冷却到期熔断器的频率 |
+| 单次探测预算（秒） | `GW_PROBE_TIMEOUT` | 2.0 | 等信号量 + 发请求的硬上限 |
+| 探测基础退避（秒） | `GW_PROBE_BACKOFF` | 0.5 | 探测失败后按 2^n 增长 |
+| 探测退避上限（秒） | `GW_PROBE_MAX_BACKOFF` | 10.0 | 退避饱和后的固定探测间隔 |
+| 退避计数上限（次） | `GW_PROBE_MAX_ATTEMPTS` | 5 | 连续失败达到后退避不再增长 |
 
 代码中也可用 `gateway.config.build_config(...)` 显式传参（测试即用该方式，
 把冷却时间缩短到 0.3s 以加快验证）。
@@ -133,13 +208,14 @@ HALF_OPEN 期间其余并发请求 ──▶ 直接拒绝 reason=circuit_rejecte
 ## 本地验证（测试）
 
 ```bash
-uv run pytest                      # 全部 16 个测试
+uv run pytest                      # 全部 21 个测试
 uv run pytest -s                  # -s 可看到每个上游结果与熔断状态变化日志
 uv run pytest tests/test_circuit_breaker.py   # 只跑熔断类
 uv run pytest tests/test_timeout.py           # 只跑超时预算类
+uv run pytest tests/test_self_healing.py      # 只跑自愈探测类
 ```
 
-四类场景：
+五类场景：
 
 1. **部分失败** `tests/test_partial_failure.py`：成功/500/畸形混合仍 200 返回
    部分结果；全失败 503；404 不熔断；失败 `data` 恒为 null、原因可区分、顺序稳定。
@@ -151,5 +227,9 @@ uv run pytest tests/test_timeout.py           # 只跑超时预算类
 4. **并发突发** `tests/test_concurrency.py`：突发 5~12 个并发聚合，服务端观测
    并发峰值不超过上限；突发响应结果签名唯一、确定可重复；串行限流不丢结果；
    熔断后突发 10 个请求对故障上游全部稳定降级。
+5. **自愈探测** `tests/test_self_healing.py`：熔断后无任何客户端请求，上游
+   恢复即被后台探测自动发现并拉回 CLOSED；并发上限=1 + 预算紧张的饱和场景下
+   探测仍收敛；长期故障上游的探测被退避节流（次数有界）但永不放弃；探测在飞
+   期间客户端请求得到 `circuit_rejected`；关闭探测后退回被动半开行为。
 
 所有上游/网络交互都发生在 `127.0.0.1`，无外部网络依赖。
